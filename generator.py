@@ -1,242 +1,157 @@
+import os, re, json, torch
+from typing import Any, Dict
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import login as hf_login
+from lmformatenforcer import JsonSchemaParser
+from lmformatenforcer.integrations.transformers import build_transformers_prefix_allowed_tokens_fn
 
-# ===============================
-# 1) Event: one note or rest
-# ===============================
-class Event:
-    """
-    A single musical event in notation terms.
-    - pitch: MIDI int (0–127) or string like "C#4" or None for rest
-    - length: 'whole','half','quarter','eighth','sixteenth',
-              'dotted_half','dotted_quarter','dotted_eighth',
-              'triplet_half','triplet_quarter','triplet_eighth'
-    - velocity: 1–127 (ignored for rests)
-    - articulation: None | 'staccato' | 'legato' | 'tenuto' | 'accent'
-    - start_offset_beats: float offset from the running cursor (syncopation)
-    - tie_next: if True and next event same pitch, merge duration
-    """
-    __slots__ = ("pitch","length","velocity","articulation",
-                 "start_offset_beats","tie_next")
+MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 
-    def __init__(self, pitch=None, length="quarter", velocity=100,
-                 articulation=None, start_offset_beats=0.0, tie_next=False):
-        self.pitch = self._to_midi(pitch) if pitch is not None else None
-        self.length = length
-        self.velocity = int(velocity)
-        self.articulation = articulation
-        self.start_offset_beats = float(start_offset_beats)
-        self.tie_next = bool(tie_next)
+# ---------- Minimal Schema ----------
+def make_minimal_schema(max_notes: int = 8) -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "bpm": {"type": "integer", "minimum": 60, "maximum": 200},
+            "notes": {
+                "type": "array",
+                "maxItems": max_notes,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "pitch": {"type": "string"},
+                        "start": {"type": "number", "minimum": 0},
+                        "duration": {"type": "number", "minimum": 0.25}
+                    },
+                    "required": ["pitch", "start", "duration"]
+                }
+            }
+        },
+        "required": ["bpm", "notes"]
+    }
 
-    # --- helpers ---
-    @staticmethod
-    def _to_midi(p):
-        if isinstance(p, int):
-            return p
-        m = re.fullmatch(r"([A-Ga-g])([#b]?)(-?\d)", str(p).strip())
-        if not m:
-            raise ValueError(f"Bad pitch: {p}")
-        name, acc, octv = m.groups()
-        base = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}[name.upper()]
-        if acc == "#": base += 1
-        if acc == "b": base -= 1
-        return base + (int(octv)+1)*12  # MIDI C4=60
+# ---------- Prompt ----------
+def build_simple_prompt(key: str, bpm: int, num_notes: int) -> str:
+    return f"""Generate a melody as JSON. Key: {key}, BPM: {bpm}, {num_notes} notes.
 
-    @staticmethod
-    def beats_for_length(token: str) -> float:
-        base = {
-            "whole":4.0, "half":2.0, "quarter":1.0,
-            "eighth":0.5, "sixteenth":0.25
-        }
-        if token in base:
-            return base[token]
-        if token.startswith("dotted_"):
-            raw = token.replace("dotted_","")
-            return base[raw]*1.5
-        if token.startswith("triplet_"):
-            raw = token.replace("triplet_","")
-            return base[raw]*(2.0/3.0)
-        raise ValueError(f"Unknown length token: {token}")
+Format:
+{{"bpm": {bpm}, "notes": [{{"pitch": "D4", "start": 0, "duration": 1}}, {{"pitch": "E4", "start": 1, "duration": 0.5}}]}}
 
-    @staticmethod
-    def apply_articulation(beats: float, articulation: str|None) -> float:
-        if articulation == "staccato":
-            return beats*0.5
-        if articulation == "tenuto":
-            return beats*0.95
-        if articulation == "legato":
-            return beats*1.05  # small overlap feel
-        return beats  # accent handled as velocity, duration unchanged
+Rules:
+- Pitch: Scientific notation (C4, F#3, Bb5)
+- Start: Beat position (0, 0.5, 1, 1.5...)
+- Duration: Note length in beats (0.25, 0.5, 1, 2...)
+- Stay in {key} scale mostly
+- No overlapping notes
 
+JSON only:"""
 
-# ==================================
-# 2) InstrumentTrack: timeline + IO
-# ==================================
-class InstrumentTrack:
-    """
-    Holds a list of Events and renders them.
-    - program: GM program number (e.g., 81 = Lead 2 Saw)
-    - bpm, ppq, time_signature
-    - start_offset_beats: track-level delay
-    """
-    def __init__(self, program=0, channel=0, bpm=120, ppq=480,
-                 time_signature=(4,4), start_offset_beats=0.0):
-        self.program = int(program)
-        self.channel = int(channel)
-        self.bpm = float(bpm)
-        self.ppq = int(ppq)
-        self.time_signature = tuple(time_signature)
-        self.start_offset_beats = float(start_offset_beats)
-        self.events: list[Event] = []
+# ---------- Repair JSON ----------
+def repair_json(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end+1]
+    text = re.sub(r",\s*}", "}", text)
+    text = re.sub(r",\s*]", "]", text)
+    return json.loads(text)
 
-        # File paths
-        self.midi_file = "track.mid"
-        self.wav_raw = "track_raw.wav"
-        self.wav_processed = "track_processed.wav"
-        self.soundfont_path = "/usr/share/sounds/sf2/FluidR3_GM.sf2"
+# ---------- Pitch name → MIDI ----------
+def add_midi_pitches(melody_json: dict) -> dict:
+    note_base = {"C":0,"D":2,"E":4,"F":5,"G":7,"A":9,"B":11}
+    accidental = {"#":1,"b":-1}
 
-        # Simple DSP defaults
-        self.eq = {"low_cut": None, "high_cut": None, "peak": None}  # peak=(freq, gain_db, Q)
-        self.comp = {"threshold_db": None, "ratio": 4}
-        self.reverb = {"decay": 0.0, "delay_s": 0.08}
+    def name_to_midi(name: str) -> int:
+        letter = name[0].upper()
+        acc = 0
+        idx = 1
+        if len(name) > 2 and name[1] in accidental:
+            acc = accidental[name[1]]
+            idx = 2
+        octave = int(name[idx:])
+        return 12 + note_base[letter] + acc + 12*octave
 
-    # --- builder API ---
-    def add(self, event: Event):
-        self.events.append(event)
-        return self
+    for note in melody_json.get("notes", []):
+        if note["pitch"].lower() not in ("rest", "r", ""):
+            note["midi"] = name_to_midi(note["pitch"])
+        else:
+            note["midi"] = None
+    return melody_json
 
-    def add_note(self, pitch, length="quarter", **kwargs):
-        return self.add(Event(pitch=pitch, length=length, **kwargs))
+# ---------- Generation ----------
+def generate_melody_with_midi(
+    pipe,
+    *,
+    key: str = "D major",
+    bpm: int = 90,
+    num_notes: int = 5,
+    temperature: float = 0.7,
+    max_new_tokens: int = 256
+) -> Dict[str, Any]:
+    prompt = build_simple_prompt(key, bpm, num_notes)
+    input_ids = pipe.tokenizer.encode(prompt, return_tensors="pt").to(pipe.model.device)
 
-    def add_rest(self, length="quarter", **kwargs):
-        return self.add(Event(pitch=None, length=length, **kwargs))
+    schema = make_minimal_schema(max_notes=num_notes + 2)
+    parser = JsonSchemaParser(schema)
+    prefix_allowed_tokens_fn = build_transformers_prefix_allowed_tokens_fn(
+        pipe.tokenizer, parser
+    )
 
-    # --- core ---
-    def to_note_sequence(self) -> music_pb2.NoteSequence:
-        seq = music_pb2.NoteSequence()
-        seq.tempos.add(qpm=self.bpm)
+    try:
+        with torch.no_grad():
+            out = pipe.model.generate(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=0.9,
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+                pad_token_id=pipe.tokenizer.pad_token_id,
+                eos_token_id=pipe.tokenizer.eos_token_id,
+            )
+        gen_ids = out[0, input_ids.shape[1]:]
+        text = pipe.tokenizer.decode(gen_ids, skip_special_tokens=True)
+        result = json.loads(text)
+    except Exception:
+        with torch.no_grad():
+            out = pipe.model.generate(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=0.9,
+                pad_token_id=pipe.tokenizer.pad_token_id,
+                eos_token_id=pipe.tokenizer.eos_token_id,
+            )
+        text = pipe.tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True)
+        result = repair_json(text)
 
-        cursor_beats = self.start_offset_beats
-        i = 0
-        while i < len(self.events):
-            ev = self.events[i]
-            # compute musical length in beats
-            beats = Event.beats_for_length(ev.length)
-            # merge ties into a single duration
-            j = i
-            if ev.pitch is not None and ev.tie_next:
-                total = beats
-                k = i+1
-                while k < len(self.events):
-                    nxt = self.events[k]
-                    if nxt.pitch is None or nxt.pitch != ev.pitch or not nxt.tie_next and k != i+1 and not nxt.tie_next:
-                        # include last if it's same pitch and previous had tie_next True
-                        # but if nxt.tie_next is False and pitch same, we still merge this final one
-                        break
-                    total += Event.beats_for_length(nxt.length)
-                    k += 1
-                    if not nxt.tie_next:  # last in chain
-                        break
-                beats = total
-                # we will skip the tied followers
-                skip_until = k
-            else:
-                skip_until = i
+    return add_midi_pitches(result)
 
-            # rest
-            if ev.pitch is None:
-                cursor_beats += beats + ev.start_offset_beats
-                i += 1
-                continue
+# ---------- Setup ----------
+def setup_llama_pipeline(model_name: str = MODEL_NAME, login_token: str | None = None):
+    if login_token or os.getenv("HUGGINGFACE_TOKEN"):
+        hf_login(token=login_token or os.getenv("HUGGINGFACE_TOKEN"))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None,
+    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    class Pipeline:
+        def __init__(self, model, tokenizer):
+            self.model = model
+            self.tokenizer = tokenizer
+    return Pipeline(model, tokenizer)
 
-            # articulation duration (sounding)
-            sound_beats = Event.apply_articulation(beats, ev.articulation)
-
-            # start offset for syncopation
-            start_beats = cursor_beats + ev.start_offset_beats
-
-            # convert to seconds (quarter = 60/bpm sec)
-            beat_sec = 60.0 / self.bpm
-            start = start_beats * beat_sec
-            end = start + sound_beats * beat_sec
-
-            note = seq.notes.add()
-            note.pitch = ev.pitch
-            note.start_time = start
-            note.end_time = end
-            note.velocity = min(127, max(1, int(ev.velocity)))
-            note.program = self.program
-            note.instrument = self.channel
-
-            # advance musical grid by *musical* beats (not staccato shortened sound)
-            cursor_beats = start_beats + beats
-
-            # skip tied followers if any
-            i = skip_until + 1
-
-        seq.total_time = cursor_beats * (60.0 / self.bpm)
-        return seq
-
-    def write_midi(self, path=None):
-        if path: self.midi_file = path
-        seq = self.to_note_sequence()
-        note_seq.sequence_proto_to_midi_file(seq, self.midi_file)
-        print(f"[MIDI] wrote {self.midi_file}")
-
-    def render(self, soundfont=None, wav_out=None, sr=44100):
-        if soundfont: self.soundfont_path = soundfont
-        if wav_out: self.wav_raw = wav_out
-        subprocess.run([
-            "fluidsynth",
-            "-ni", self.soundfont_path,
-            self.midi_file,
-            "-F", self.wav_raw,
-            "-r", str(sr)
-        ], check=True)
-        print(f"[Render] wrote {self.wav_raw}")
-
-    # ---- optional simple DSP (EQ/comp/reverb) ----
-    def process(self, wav_out=None):
-        if wav_out: self.wav_processed = wav_out
-        y, sr = librosa.load(self.wav_raw, sr=None)
-
-        # EQ
-        if self.eq.get("low_cut"):
-            b,a = signal.butter(2, self.eq["low_cut"], btype='high', fs=sr)
-            y = signal.filtfilt(b,a,y)
-        if self.eq.get("high_cut"):
-            b,a = signal.butter(2, self.eq["high_cut"], btype='low', fs=sr)
-            y = signal.filtfilt(b,a,y)
-        if self.eq.get("peak"):
-            freq, gain_db, Q = self.eq["peak"]
-            A = 10**(gain_db/40)
-            w0 = 2*np.pi*freq/sr
-            alpha = np.sin(w0)/(2*Q)
-            b0 = 1 + alpha*A; b1 = -2*np.cos(w0); b2 = 1 - alpha*A
-            a0 = 1 + alpha/A; a1 = -2*np.cos(w0); a2 = 1 - alpha/A
-            b = np.array([b0,b1,b2]) / a0
-            a = np.array([1,a1/a0,a2/a0])
-            y = signal.lfilter(b,a,y)
-
-        # Compression (very simple)
-        if self.comp.get("threshold_db") is not None:
-            thr = 10**(self.comp["threshold_db"]/20.0)
-            ratio = float(self.comp.get("ratio", 4))
-            over = np.abs(y) > thr
-            y2 = y.copy()
-            y2[over] = np.sign(y[over]) * (thr + (np.abs(y[over]) - thr)/ratio)
-            y = y2
-
-        # Reverb (simple feedback delay)
-        if self.reverb.get("decay", 0.0) > 0:
-            decay = float(self.reverb["decay"])
-            delay_s = float(self.reverb.get("delay_s", 0.08))
-            d = int(sr*delay_s)
-            out = y.copy()
-            for i in range(d, len(out)):
-                out[i] += decay*out[i-d]
-            y = out
-
-        sf.write(self.wav_processed, y, sr)
-        print(f"[Process] wrote {self.wav_processed}")
-
-    def audio(self):
-        return ipd.Audio(self.wav_processed if os.path.exists(self.wav_processed) else self.wav_raw)
+  pipe = setup_llama_pipeline()
+  melody = generate_melody_with_midi(pipe, key="G major", bpm=120, num_notes=6, temperature=0.8)
+  print(json.dumps(melody, indent=2))
