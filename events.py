@@ -1,3 +1,4 @@
+from note_seq.protobuf import music_pb2
 
 # ===============================
 # 1) Event: one note or rest
