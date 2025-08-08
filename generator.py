@@ -146,6 +146,4 @@ def setup_llama_pipeline(model_name: str = MODEL_NAME, login_token: str | None =
             self.tokenizer = tokenizer
     return Pipeline(model, tokenizer)
 
-  pipe = setup_llama_pipeline()
-  melody = generate_melody_with_midi(pipe, key="G major", bpm=120, num_notes=6, temperature=0.8)
-  print(json.dumps(melody, indent=2))
+
