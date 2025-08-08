@@ -1,9 +1,3 @@
-import os, re, json, torch
-from typing import Any, Dict
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from huggingface_hub import login as hf_login
-from lmformatenforcer import JsonSchemaParser
-from lmformatenforcer.integrations.transformers import build_transformers_prefix_allowed_tokens_fn
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 
