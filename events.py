@@ -1,16 +1,5 @@
 
 
-import re
-import os
-import subprocess
-import numpy as np
-import librosa
-import soundfile as sf
-from scipy import signal
-import IPython.display as ipd
-from note_seq.protobuf import music_pb2
-import note_seq
-
 class Event:
     """
     A single musical event in notation terms.
