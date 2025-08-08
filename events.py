@@ -1,5 +1,8 @@
 
 
+# ===============================
+# 1) Event: one note or rest
+# ===============================
 class Event:
     """
     A single musical event in notation terms.
@@ -191,50 +194,3 @@ class InstrumentTrack:
         ], check=True)
         print(f"[Render] wrote {self.wav_raw}")
 
-    # ---- optional simple DSP (EQ/comp/reverb) ----
-    def process(self, wav_out=None):
-        if wav_out: self.wav_processed = wav_out
-        y, sr = librosa.load(self.wav_raw, sr=None)
-
-        # EQ
-        if self.eq.get("low_cut"):
-            b,a = signal.butter(2, self.eq["low_cut"], btype='high', fs=sr)
-            y = signal.filtfilt(b,a,y)
-        if self.eq.get("high_cut"):
-            b,a = signal.butter(2, self.eq["high_cut"], btype='low', fs=sr)
-            y = signal.filtfilt(b,a,y)
-        if self.eq.get("peak"):
-            freq, gain_db, Q = self.eq["peak"]
-            A = 10**(gain_db/40)
-            w0 = 2*np.pi*freq/sr
-            alpha = np.sin(w0)/(2*Q)
-            b0 = 1 + alpha*A; b1 = -2*np.cos(w0); b2 = 1 - alpha*A
-            a0 = 1 + alpha/A; a1 = -2*np.cos(w0); a2 = 1 - alpha/A
-            b = np.array([b0,b1,b2]) / a0
-            a = np.array([1,a1/a0,a2/a0])
-            y = signal.lfilter(b,a,y)
-
-        # Compression (very simple)
-        if self.comp.get("threshold_db") is not None:
-            thr = 10**(self.comp["threshold_db"]/20.0)
-            ratio = float(self.comp.get("ratio", 4))
-            over = np.abs(y) > thr
-            y2 = y.copy()
-            y2[over] = np.sign(y[over]) * (thr + (np.abs(y[over]) - thr)/ratio)
-            y = y2
-
-        # Reverb (simple feedback delay)
-        if self.reverb.get("decay", 0.0) > 0:
-            decay = float(self.reverb["decay"])
-            delay_s = float(self.reverb.get("delay_s", 0.08))
-            d = int(sr*delay_s)
-            out = y.copy()
-            for i in range(d, len(out)):
-                out[i] += decay*out[i-d]
-            y = out
-
-        sf.write(self.wav_processed, y, sr)
-        print(f"[Process] wrote {self.wav_processed}")
-
-    def audio(self):
-        return ipd.Audio(self.wav_processed if os.path.exists(self.wav_processed) else self.wav_raw)
